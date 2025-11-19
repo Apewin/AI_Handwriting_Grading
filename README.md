@@ -1,5 +1,5 @@
 
-# AP FRQ AI Grader
+# Siamese-An AI tool for Teacher read free-respond questions
 
 This is a modern React web application that uses **Google Gemini** to grade handwritten AP Free Response Questions (FRQs).
 
