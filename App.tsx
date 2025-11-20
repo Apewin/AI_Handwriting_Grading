@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { GoogleGenAI, Schema, Type } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import { GradingResult } from './types';
 
 const DEFAULT_QUESTION = "";
@@ -12,13 +12,55 @@ const MODELS = [
 
 const ACCEPTED_TYPES = "image/*,application/pdf,.heic,.HEIC";
 
+// Utility to resize images to reduce payload size and prevent RPC errors
+const resizeImage = (file: File): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+        const MAX_DIMENSION = 1536; // 1536px is sufficient for handwriting recognition
+
+        if (width > height) {
+          if (width > MAX_DIMENSION) {
+            height *= MAX_DIMENSION / width;
+            width = MAX_DIMENSION;
+          }
+        } else {
+          if (height > MAX_DIMENSION) {
+            width *= MAX_DIMENSION / height;
+            height = MAX_DIMENSION;
+          }
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx?.drawImage(img, 0, 0, width, height);
+        // Compress to JPEG quality 0.8 to significantly reduce size
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+        resolve(dataUrl.split(',')[1]);
+      };
+      img.onerror = reject;
+      img.src = e.target?.result as string;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+};
+
 export default function App() {
   // --- State ---
   
   // 0. Model Selection
   const [model, setModel] = useState<string>(MODELS[0].id);
 
-  // 1. Student Response (Image/PDF)
+  // 1. Student Response (Text or Image/PDF)
+  const [studentMode, setStudentMode] = useState<'text' | 'file'>('file');
+  const [studentText, setStudentText] = useState<string>("");
   const [studentFile, setStudentFile] = useState<File | null>(null);
   const [studentPreview, setStudentPreview] = useState<string | null>(null);
   const [isDraggingStudent, setIsDraggingStudent] = useState(false);
@@ -112,7 +154,22 @@ export default function App() {
     }
   };
 
-  const fileToGenerativePart = (file: File): Promise<{ inlineData: { data: string; mimeType: string } }> => {
+  const fileToGenerativePart = async (file: File): Promise<{ inlineData: { data: string; mimeType: string } }> => {
+    // Attempt to resize standard images to prevent "Rpc failed" errors due to payload size
+    if (file.type.match(/image\/(jpeg|png|webp)/)) {
+      try {
+        const resizedBase64 = await resizeImage(file);
+        return {
+          inlineData: {
+            data: resizedBase64,
+            mimeType: 'image/jpeg',
+          }
+        };
+      } catch (e) {
+        console.warn("Image resize failed, falling back to original file.", e);
+      }
+    }
+
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onloadend = () => {
@@ -143,14 +200,22 @@ export default function App() {
   // --- Core Logic ---
 
   const handleGrade = async () => {
-    if (!studentFile) {
-      setError("Please upload the student's answer.");
+    // Validation for Student Response
+    if (studentMode === 'file' && !studentFile) {
+      setError("Please upload the student's answer file.");
       return;
     }
+    if (studentMode === 'text' && !studentText.trim()) {
+      setError("Please enter the student's answer text.");
+      return;
+    }
+
     if (!question.trim()) {
       setError("Please enter the Question Prompt.");
       return;
     }
+
+    // Validation for Rubric
     if (rubricMode === 'text' && !rubricText.trim()) {
       setError("Please enter the grading rubric text.");
       return;
@@ -169,11 +234,19 @@ export default function App() {
 
       const parts: any[] = [];
 
-      // 1. Add Student Answer File
-      const studentPart = await fileToGenerativePart(studentFile);
-      parts.push(studentPart);
+      // 1. Process Student Response (Text or File)
+      let studentPromptContent = "";
+      
+      if (studentMode === 'file' && studentFile) {
+        const studentPart = await fileToGenerativePart(studentFile);
+        parts.push(studentPart);
+        studentPromptContent = "(See attached image/PDF)";
+      } else {
+        // If text mode, we'll insert it directly into the prompt string below
+        studentPromptContent = studentText;
+      }
 
-      // 2. Add Rubric (Text or File)
+      // 2. Process Rubric (Text or File)
       let rubricContent = "";
       if (rubricMode === 'file' && rubricFile) {
         const rubricPart = await fileToGenerativePart(rubricFile);
@@ -206,7 +279,7 @@ Evaluate the provided "Student Response" based **strictly** on the provided "Sco
 **Input Data:**
 * **[Question Prompt]:** "${question}"
 * **[Scoring Guidelines]:** "${rubricContent}"
-* **[Student Response]:** (See attached image/PDF)
+* **[Student Response]:** ${studentPromptContent}
 
 **Output Requirement:**
 You must output the result strictly in JSON format matching the provided schema. 
@@ -215,11 +288,11 @@ You must output the result strictly in JSON format matching the provided schema.
 - Map "Total Score" to 'totalScore'.
       `;
 
-      const responseSchema: Schema = {
+      const responseSchema = {
         type: Type.OBJECT,
         properties: {
           studentName: { type: Type.STRING, description: "Name of student if found, else 'Student'" },
-          recognizedText: { type: Type.STRING, description: "Transcription of student response" },
+          recognizedText: { type: Type.STRING, description: "Transcription of student response (if image/pdf) or the provided text" },
           feedback: { type: Type.STRING, description: "Critical feedback explaining the score and specific errors." },
           totalScore: { type: Type.NUMBER, description: "Total points awarded" },
           maxScore: { type: Type.NUMBER, description: "Total possible points" },
@@ -263,13 +336,19 @@ You must output the result strictly in JSON format matching the provided schema.
 
     } catch (err: any) {
       console.error(err);
-      setError(err.message || "An error occurred. Please ensure files are valid images or PDFs.");
+      let msg = err.message || "An error occurred.";
+      if (msg.includes("500") || msg.includes("Rpc failed") || msg.includes("xhr error")) {
+        msg += " (Network error: The file might be too large or the connection timed out. Try a smaller image.)";
+      }
+      setError(msg);
     } finally {
       setIsLoading(false);
     }
   };
 
-  const isReady = studentFile && question.trim() && (rubricMode === 'text' ? rubricText.trim() : rubricFile);
+  const isStudentReady = (studentMode === 'text' ? studentText.trim() : studentFile);
+  const isRubricReady = (rubricMode === 'text' ? rubricText.trim() : rubricFile);
+  const isReady = isStudentReady && question.trim() && isRubricReady;
 
   // Render helper for file preview
   const renderFilePreview = (file: File, preview: string | null, isSmall = false) => {
@@ -324,35 +403,66 @@ You must output the result strictly in JSON format matching the provided schema.
           {/* 1. Student Response Card */}
           <div className="card input-card">
             <h2>1. Student Response</h2>
-            <div 
-              className={`drop-zone ${studentFile ? 'has-file' : ''} ${isDraggingStudent ? 'drag-active' : ''}`}
-              onClick={() => studentInputRef.current?.click()}
-              onDragOver={(e) => handleDragOver(e, setIsDraggingStudent)}
-              onDragLeave={(e) => handleDragLeave(e, setIsDraggingStudent)}
-              onDrop={(e) => handleDrop(e, setIsDraggingStudent, setStudentFile, setStudentPreview)}
-            >
-              <input 
-                type="file" 
-                ref={studentInputRef} 
-                onChange={(e) => handleFileUpload(e, setStudentFile, setStudentPreview)} 
-                accept={ACCEPTED_TYPES}
-                hidden 
-              />
-              
-              {studentFile ? (
-                <div className="file-preview">
-                  {renderFilePreview(studentFile, studentPreview)}
+            
+            <div className="form-group">
+              <div className="label-row">
+                <label>Input Format</label>
+                <div className="toggle-switch">
                   <button 
-                    className="change-file-btn"
-                    onClick={(e) => { e.stopPropagation(); studentInputRef.current?.click(); }}
+                    className={studentMode === 'file' ? 'active' : ''} 
+                    onClick={() => setStudentMode('file')}
                   >
-                    Change File
+                    File Upload
+                  </button>
+                  <button 
+                    className={studentMode === 'text' ? 'active' : ''} 
+                    onClick={() => setStudentMode('text')}
+                  >
+                    Text
                   </button>
                 </div>
+              </div>
+
+              {studentMode === 'text' ? (
+                <textarea 
+                  value={studentText} 
+                  onChange={(e) => setStudentText(e.target.value)}
+                  placeholder="Paste the student's answer here..."
+                  rows={6}
+                  className="rubric-textarea fade-in"
+                />
               ) : (
-                <div className="upload-placeholder">
-                  <span className="icon">📄</span>
-                  <p>Drag & Drop Student Answer<br/><small>(Image, HEIC, or PDF)</small></p>
+                <div 
+                  className={`drop-zone ${studentFile ? 'has-file' : ''} ${isDraggingStudent ? 'drag-active' : ''}`}
+                  onClick={() => studentInputRef.current?.click()}
+                  onDragOver={(e) => handleDragOver(e, setIsDraggingStudent)}
+                  onDragLeave={(e) => handleDragLeave(e, setIsDraggingStudent)}
+                  onDrop={(e) => handleDrop(e, setIsDraggingStudent, setStudentFile, setStudentPreview)}
+                >
+                  <input 
+                    type="file" 
+                    ref={studentInputRef} 
+                    onChange={(e) => handleFileUpload(e, setStudentFile, setStudentPreview)} 
+                    accept={ACCEPTED_TYPES}
+                    hidden 
+                  />
+                  
+                  {studentFile ? (
+                    <div className="file-preview">
+                      {renderFilePreview(studentFile, studentPreview)}
+                      <button 
+                        className="change-file-btn"
+                        onClick={(e) => { e.stopPropagation(); studentInputRef.current?.click(); }}
+                      >
+                        Change File
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="upload-placeholder">
+                      <span className="icon">📄</span>
+                      <p>Drag & Drop Student Answer<br/><small>(Image, HEIC, or PDF)</small></p>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
